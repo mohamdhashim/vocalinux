@@ -652,6 +652,11 @@ class EvdevKeyboardBackend(KeyboardBackend):
                 device_id = id(device)
 
                 if value == 1:  # Key press
+                    # Track whether ANY device already had the key held before
+                    # this event. Multiple physical/virtual keyboards all report
+                    # the same modifier press; only the first one should fire the
+                    # callback to avoid duplicate start-sounds or state races.
+                    already_held = len(self.key_pressed_devices) > 0
                     self.key_pressed_devices.add(device_id)
                     current_time = time.time()
 
@@ -666,8 +671,9 @@ class EvdevKeyboardBackend(KeyboardBackend):
                             self.last_trigger_time = current_time
                             threading.Thread(target=self.double_tap_callback, daemon=True).start()
                     elif self._mode == "push_to_talk":
-                        # Trigger on press
-                        if self.key_press_callback is not None:
+                        # Only fire on the first device that reports the press.
+                        # Subsequent devices holding the same key are duplicates.
+                        if not already_held and self.key_press_callback is not None:
                             logger.debug(f"Key press {self._modifier_key} detected (evdev)")
                             threading.Thread(target=self.key_press_callback, daemon=True).start()
 
@@ -677,8 +683,10 @@ class EvdevKeyboardBackend(KeyboardBackend):
                     self.key_pressed_devices.discard(device_id)
 
                     if self._mode == "push_to_talk":
-                        # Trigger on release
-                        if self.key_release_callback is not None:
+                        # Only fire when the LAST device releases the key so a
+                        # second keyboard reporting the same release doesn't
+                        # prematurely stop an active recording.
+                        if len(self.key_pressed_devices) == 0 and self.key_release_callback is not None:
                             logger.debug(f"Key release {self._modifier_key} detected (evdev)")
                             threading.Thread(target=self.key_release_callback, daemon=True).start()
 
