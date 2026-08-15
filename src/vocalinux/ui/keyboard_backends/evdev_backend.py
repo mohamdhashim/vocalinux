@@ -439,6 +439,17 @@ class EvdevKeyboardBackend(KeyboardBackend):
             logger.warning(f"Cannot open {device_path}: {e}")
             return False
 
+        # Skip virtual/synthetic devices (ydotoold, uinput helpers, etc.).
+        # Real physical keyboards always have a non-empty phys bus path
+        # (e.g. "usb-0000:00:14.0-2/input0"). Virtual devices have phys="".
+        if not device.phys:
+            logger.debug(f"Skipping virtual device: {device_path} ({device.name})")
+            try:
+                device.close()
+            except Exception:
+                pass
+            return False
+
         with self._devices_lock:
             if device_path in self.device_paths or fd in self.device_fds:
                 try:
