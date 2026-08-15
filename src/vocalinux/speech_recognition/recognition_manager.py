@@ -871,6 +871,7 @@ class SpeechRecognitionManager:
         self._last_audio_error_time = 0
         self._audio_stream = None
         self._pyaudio_instance = None
+        self._pyaudio_lock = threading.Lock()  # Serialize PyAudio init/terminate
         self._capture_sample_rate = 16000  # Default, updated when device is opened
 
         # Create models directory if it doesn't exist
@@ -943,6 +944,7 @@ class SpeechRecognitionManager:
             self.recognizer = KaldiRecognizer(self.model, 16000)
             self._model_initialized = True
             logger.info("VOSK engine initialized successfully.")
+            threading.Thread(target=self._prewarm_pyaudio, daemon=True).start()
 
         except ImportError:
             logger.error("Failed to import VOSK. Please install it with 'pip install vosk'")
@@ -1007,6 +1009,7 @@ class SpeechRecognitionManager:
             self._model_initialized = True
             logger.info(f"Whisper model loaded on {device.upper()}")
             logger.info("Whisper engine initialized successfully.")
+            threading.Thread(target=self._prewarm_pyaudio, daemon=True).start()
 
         except ImportError as e:
             logger.error(f"Failed to import required libraries for Whisper: {e}")
@@ -1300,6 +1303,7 @@ class SpeechRecognitionManager:
 
         self._model_initialized = True
         logger.info("whisper.cpp engine initialized successfully.")
+        threading.Thread(target=self._prewarm_pyaudio, daemon=True).start()
 
     def _handle_gpu_fallback(self, error, model_path: str, model_kwargs: dict, cpu_backend):
         """Handle GPU backend failure by falling back to CPU.
@@ -1460,6 +1464,7 @@ class SpeechRecognitionManager:
         # Remote API does not need local models, directly mark as ready
         self._model_initialized = True
         logger.info("Remote API engine setup complete.")
+        threading.Thread(target=self._prewarm_pyaudio, daemon=True).start()
 
     def _transcribe_with_remote_api(self, audio_buffer: list[bytes], session) -> str:
         """Transcribe audio via remote API.
@@ -2235,6 +2240,19 @@ class SpeechRecognitionManager:
         chunk_duration_ms = (1024 / 16000) * 1000
         return int(guard_ms / chunk_duration_ms)
 
+    def _prewarm_pyaudio(self) -> None:
+        """Initialize PyAudio in the background so the first recording starts immediately."""
+        with self._pyaudio_lock:
+            if self._pyaudio_instance is not None:
+                return
+            try:
+                import pyaudio
+
+                self._pyaudio_instance = pyaudio.PyAudio()
+                logger.debug("PyAudio pre-warmed")
+            except Exception as e:
+                logger.debug(f"PyAudio pre-warm failed (will init on demand): {e}")
+
     def start_recognition(self, mode: str = "toggle"):
         """Start the speech recognition process."""
         if self.state != RecognitionState.IDLE:
@@ -2353,9 +2371,15 @@ class SpeechRecognitionManager:
             CHUNK = 1024
             FORMAT = pyaudio.paInt16
 
-            # Initialize PyAudio with reconnection support
-            self._pyaudio_instance = pyaudio.PyAudio()
-            audio = self._pyaudio_instance
+            # Reuse a pre-warmed PyAudio instance to avoid the 300-1500ms
+            # PortAudio Pa_Initialize() device-scan on every recording start.
+            with self._pyaudio_lock:
+                if self._pyaudio_instance is None:
+                    self._pyaudio_instance = pyaudio.PyAudio()
+                    logger.debug("PyAudio initialized (cold start)")
+                else:
+                    logger.debug("PyAudio reused (warm start)")
+                audio = self._pyaudio_instance
 
             # Resolve the input device by name first (indices can shift between
             # sessions due to USB replugging or virtual devices being added).
@@ -2372,21 +2396,27 @@ class SpeechRecognitionManager:
                 )
                 play_error_sound()
                 audio.terminate()
+                self._pyaudio_instance = None
                 self._update_state(RecognitionState.ERROR)
                 return
 
-            # Log available devices for debugging (skip virtual devices)
-            logger.debug("Available audio input devices:")
-            for i in range(audio.get_device_count()):
-                try:
-                    info = audio.get_device_info_by_index(i)
-                    if info.get("maxInputChannels", 0) > 0:
-                        name = info.get("name", "")
-                        if _is_virtual_device(name):
-                            continue
-                        logger.debug(f"  [{i}] {name} (inputs: {info.get('maxInputChannels')})")
-                except (IOError, OSError):
-                    continue
+            # Log available devices for debugging (skip virtual devices).
+            # Guard with isEnabledFor to avoid PortAudio get_device_info calls
+            # in normal usage — they add measurable latency at session start.
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Available audio input devices:")
+                for i in range(audio.get_device_count()):
+                    try:
+                        info = audio.get_device_info_by_index(i)
+                        if info.get("maxInputChannels", 0) > 0:
+                            name = info.get("name", "")
+                            if _is_virtual_device(name):
+                                continue
+                            logger.debug(
+                                f"  [{i}] {name} (inputs: {info.get('maxInputChannels')})"
+                            )
+                    except (IOError, OSError):
+                        continue
 
             # Detect supported channel count first (some devices require stereo)
             CHANNELS = _get_supported_channels(audio, resolved_device_index)
@@ -2435,6 +2465,7 @@ class SpeechRecognitionManager:
                 else:
                     play_error_sound()
                     audio.terminate()
+                    self._pyaudio_instance = None
                     self._update_state(RecognitionState.ERROR)
                     return
 
@@ -2620,7 +2651,8 @@ class SpeechRecognitionManager:
                     logger.error(f"Unexpected error reading audio data: {e}")
                     break
 
-            # Clean up
+            # Clean up — close the stream but keep the PyAudio instance warm so
+            # the next session skips the expensive Pa_Initialize() device scan.
             if stream and hasattr(stream, "is_active") and stream.is_active():
                 try:
                     stream.stop_stream()
@@ -2628,15 +2660,8 @@ class SpeechRecognitionManager:
                 except Exception as e:
                     logger.warning(f"Error closing audio stream: {e}")
 
-            if audio and hasattr(audio, "terminate"):
-                try:
-                    audio.terminate()
-                except Exception as e:
-                    logger.warning(f"Error terminating PyAudio: {e}")
-
-            # Reset audio stream reference and reconnection state
             self._audio_stream = None
-            self._pyaudio_instance = None
+            # _pyaudio_instance intentionally kept alive for the next session
             self._reconnection_attempts = 0
             self._last_audio_error_time = 0
 
@@ -3079,6 +3104,17 @@ class SpeechRecognitionManager:
         if self.state != RecognitionState.IDLE:
             logger.info("Stopping active recognition before resume reinit")
             self.stop_recognition()
+
+        # PortAudio's internal state can become stale after system suspend/resume.
+        # Terminate and discard the warm instance so _record_audio() creates a
+        # fresh one on the next recording.
+        with self._pyaudio_lock:
+            if self._pyaudio_instance is not None:
+                try:
+                    self._pyaudio_instance.terminate()
+                except Exception:
+                    pass
+                self._pyaudio_instance = None
 
         with self._model_lock:
             self.model = None

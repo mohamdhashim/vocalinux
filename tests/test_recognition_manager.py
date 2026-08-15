@@ -195,7 +195,8 @@ class TestSpeechRecognition(unittest.TestCase):
         self.assertEqual(manager.state, RecognitionState.LISTENING)
         self.assertTrue(manager.should_record)
         mock_audio_feedback.play_start_sound.assert_called_once()
-        self.assertEqual(self.threadMock.call_count, 2)
+        # 1 pre-warm thread (from _init_vosk) + 2 from start_recognition (audio + recognition)
+        self.assertEqual(self.threadMock.call_count, 3)
         self.threadInstance.start.assert_called()
 
         # Reset mocks
