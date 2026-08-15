@@ -2373,13 +2373,19 @@ class SpeechRecognitionManager:
 
             # Reuse a pre-warmed PyAudio instance to avoid the 300-1500ms
             # PortAudio Pa_Initialize() device-scan on every recording start.
-            with self._pyaudio_lock:
-                if self._pyaudio_instance is None:
-                    self._pyaudio_instance = pyaudio.PyAudio()
-                    logger.debug("PyAudio initialized (cold start)")
-                else:
-                    logger.debug("PyAudio reused (warm start)")
+            # Do NOT acquire _pyaudio_lock here: if the pre-warm thread still
+            # holds it we would block after play_start_sound() has fired,
+            # causing a gap between the beep and actual capture that confuses
+            # users into pressing Alt again (double-beep symptom).
+            # Worst case: pre-warm and recording race → two Pa_Initialize()
+            # calls, one wins; harmless since the instance is replaced anyway.
+            if self._pyaudio_instance is not None:
                 audio = self._pyaudio_instance
+                logger.debug("PyAudio reused (warm start)")
+            else:
+                self._pyaudio_instance = pyaudio.PyAudio()
+                audio = self._pyaudio_instance
+                logger.debug("PyAudio initialized (cold start)")
 
             # Resolve the input device by name first (indices can shift between
             # sessions due to USB replugging or virtual devices being added).
