@@ -388,6 +388,8 @@ class EvdevKeyboardBackend(KeyboardBackend):
             logger.error("Failed to open any keyboard device (permission denied?)")
             return False
 
+        logger.info(f"Listening on {len(self.devices)} physical keyboard device(s) (virtual devices excluded)")
+
         # Start monitoring thread
         self.running = True
         self.monitor_thread = threading.Thread(target=self._monitor_devices, daemon=True)
